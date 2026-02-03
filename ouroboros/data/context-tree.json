@@ -1,0 +1,85 @@
+{
+  "nodes": [
+    {
+      "session_id": "ctx-task-002",
+      "claude_session_id": null,
+      "parent_session": "ctx-c253c5cd",
+      "cached_prefix": null,
+      "delta_docs": [
+        "./data/results/task-002-result.md"
+      ],
+      "created_at": "2026-02-03T05:27:22.028385Z",
+      "status": "active"
+    },
+    {
+      "session_id": "ctx-task-001",
+      "claude_session_id": null,
+      "parent_session": "ctx-64cb32d6",
+      "cached_prefix": null,
+      "delta_docs": [
+        "./data/results/task-001-result.md"
+      ],
+      "created_at": "2026-02-03T05:26:37.759511Z",
+      "status": "active"
+    },
+    {
+      "session_id": "ctx-64cb32d6",
+      "claude_session_id": "689b7fe6-a1e6-40cb-8f13-6bf6f06693bd",
+      "parent_session": null,
+      "cached_prefix": null,
+      "delta_docs": [],
+      "created_at": "2026-02-03T05:26:37.759471Z",
+      "status": "active"
+    },
+    {
+      "session_id": "ctx-c253c5cd",
+      "claude_session_id": "689b7fe6-a1e6-40cb-8f13-6bf6f06693bd",
+      "parent_session": null,
+      "cached_prefix": null,
+      "delta_docs": [],
+      "created_at": "2026-02-03T05:27:22.028354Z",
+      "status": "active"
+    },
+    {
+      "session_id": "ctx-task-003",
+      "claude_session_id": "8f04c351-f7e8-44a0-b8fd-78b74812a64d",
+      "parent_session": "ctx-c253c5cd",
+      "cached_prefix": null,
+      "delta_docs": [
+        "./data/results/task-003-result.md"
+      ],
+      "created_at": "2026-02-03T05:43:14.918632Z",
+      "status": "active"
+    }
+  ],
+  "fork_points": [
+    {
+      "id": "fork-bef74448",
+      "source_context": "ctx-64cb32d6",
+      "trigger_task": "fork-point",
+      "branches": [
+        "ctx-task-001"
+      ],
+      "created_at": "2026-02-03T05:26:37.759509Z"
+    },
+    {
+      "id": "fork-4db413e5",
+      "source_context": "ctx-c253c5cd",
+      "trigger_task": "fork-point",
+      "branches": [
+        "ctx-task-002"
+      ],
+      "created_at": "2026-02-03T05:27:22.028383Z"
+    },
+    {
+      "id": "fork-f777dc3c",
+      "source_context": "ctx-c253c5cd",
+      "trigger_task": "sequential-fork",
+      "branches": [
+        "ctx-task-003"
+      ],
+      "created_at": "2026-02-03T05:43:14.918630Z"
+    }
+  ],
+  "root": "ctx-c253c5cd"
+}
