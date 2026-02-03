@@ -31,6 +31,16 @@ enum Commands {
     Plan {
         /// The goal to achieve
         goal: String,
+
+        /// Optional label for the session (e.g., "api-refactor")
+        #[arg(short, long)]
+        label: Option<String>,
+    },
+
+    /// Manage work sessions
+    WorkSessions {
+        #[command(subcommand)]
+        action: WorkSessionAction,
     },
 
     /// List all tasks
@@ -44,6 +54,10 @@ enum Commands {
         /// Run all tasks
         #[arg(long)]
         all: bool,
+
+        /// Auto-validate and fix after each task
+        #[arg(long)]
+        auto_validate: bool,
     },
 
     /// Validate a task result (single check)
@@ -62,6 +76,12 @@ enum Commands {
         task_id: String,
     },
 
+    /// Validate and fix a task result
+    Fix {
+        /// Task ID to validate and fix
+        task_id: String,
+    },
+
     /// Show execution statistics
     Stats,
 
@@ -75,7 +95,27 @@ enum Commands {
         #[arg(short, long)]
         search: Option<String>,
     },
+}
 
+#[derive(Subcommand)]
+enum WorkSessionAction {
+    /// List all work sessions
+    List,
+
+    /// Show current session info
+    Current,
+
+    /// Switch to a different session
+    Switch {
+        /// Session ID or prefix
+        session_id: String,
+    },
+
+    /// Show details of a session
+    Show {
+        /// Session ID or prefix
+        session_id: String,
+    },
 }
 
 #[tokio::main]
@@ -96,12 +136,109 @@ async fn main() -> Result<()> {
             println!("Project initialized at {:?}", cli.data_dir);
         }
 
-        Commands::Plan { ref goal } => {
+        Commands::Plan { ref goal, ref label } => {
             let mut orch = create_orchestrator(&cli)?;
-            let task_ids = orch.plan(goal).await?;
+            let task_ids = orch.plan_with_label(goal, label.clone()).await?;
+
+            if let Some(session) = orch.current_session() {
+                println!("Session: {} ({})", session.id, session.goal);
+            }
             println!("Created {} tasks:", task_ids.len());
             for id in task_ids {
                 println!("  - {}", id);
+            }
+        }
+
+        Commands::WorkSessions { ref action } => {
+            use ouroboros::work_session::WorkSessionStatus;
+
+            let mut orch = create_orchestrator(&cli)?;
+
+            match action {
+                WorkSessionAction::List => {
+                    let sessions = orch.list_sessions()?;
+                    if sessions.is_empty() {
+                        println!("No work sessions found. Run 'ouroboros plan \"<goal>\"' to create one.");
+                    } else {
+                        println!("Work Sessions:");
+                        println!("{}", "=".repeat(70));
+                        for s in sessions {
+                            let status_icon = match s.status {
+                                WorkSessionStatus::Pending => "○",
+                                WorkSessionStatus::Running => "◐",
+                                WorkSessionStatus::Completed => "●",
+                                WorkSessionStatus::Failed => "✗",
+                                WorkSessionStatus::Archived => "◌",
+                            };
+                            let label_str = s.label.as_ref()
+                                .map(|l| format!(" [{}]", l))
+                                .unwrap_or_default();
+                            let progress = format!("{}/{}", s.completed_count, s.task_count);
+                            let date = s.created_at.format("%Y-%m-%d %H:%M").to_string();
+                            let goal_short = if s.goal.len() > 40 {
+                                format!("{}...", &s.goal[..37])
+                            } else {
+                                s.goal.clone()
+                            };
+
+                            println!("{} {}{}  {}  {}  {}",
+                                status_icon, &s.id[..6.min(s.id.len())], label_str, progress, date, goal_short);
+                        }
+                    }
+                }
+
+                WorkSessionAction::Current => {
+                    if let Some(session) = orch.current_session() {
+                        println!("Current Session: {}", session.id);
+                        println!("  Goal:     {}", session.goal);
+                        println!("  Status:   {:?}", session.status);
+                        println!("  Progress: {}/{}", session.completed_count, session.task_count);
+                        println!("  Created:  {}", session.created_at.format("%Y-%m-%d %H:%M"));
+                        if let Some(label) = &session.label {
+                            println!("  Label:    {}", label);
+                        }
+                    } else {
+                        println!("No current session. Run 'ouroboros plan \"<goal>\"' to create one.");
+                    }
+                }
+
+                WorkSessionAction::Switch { ref session_id } => {
+                    orch.switch_session(session_id)?;
+                    if let Some(session) = orch.current_session() {
+                        println!("Switched to session: {}", session.id);
+                        println!("  Goal: {}", session.goal);
+                    }
+                }
+
+                WorkSessionAction::Show { ref session_id } => {
+                    orch.switch_session(session_id)?;
+                    if let Some(session) = orch.current_session() {
+                        println!("Session: {}", session.id);
+                        println!("  Goal:      {}", session.goal);
+                        println!("  Status:    {:?}", session.status);
+                        println!("  Progress:  {}/{}", session.completed_count, session.task_count);
+                        println!("  Failed:    {}", session.failed_count);
+                        println!("  Created:   {}", session.created_at.format("%Y-%m-%d %H:%M"));
+                        if let Some(completed) = session.completed_at {
+                            println!("  Completed: {}", completed.format("%Y-%m-%d %H:%M"));
+                        }
+                        if let Some(label) = &session.label {
+                            println!("  Label:     {}", label);
+                        }
+
+                        // Show tasks
+                        println!("\nTasks:");
+                        for task in orch.tasks() {
+                            let status = match &task.status {
+                                ouroboros::dag::TaskStatus::Pending => "[ ]",
+                                ouroboros::dag::TaskStatus::InProgress => "[~]",
+                                ouroboros::dag::TaskStatus::Completed => "[✓]",
+                                ouroboros::dag::TaskStatus::Failed { .. } => "[✗]",
+                            };
+                            println!("  {} {} - {}", status, task.id, task.subject);
+                        }
+                    }
+                }
             }
         }
 
@@ -124,8 +261,12 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Run { ref task_id, all } => {
-            let mut orch = create_orchestrator(&cli)?;
+        Commands::Run { ref task_id, all, auto_validate } => {
+            let mut orch = create_orchestrator_with_config(&cli, auto_validate)?;
+
+            if auto_validate {
+                println!("Auto-validation enabled: tasks will be checked and fixed if needed");
+            }
 
             if all || task_id.is_none() {
                 println!("Running all tasks...");
@@ -263,6 +404,30 @@ async fn main() -> Result<()> {
             }
         }
 
+        Commands::Fix { ref task_id } => {
+            use ouroboros::orchestrator::IssueSeverity;
+
+            let mut orch = create_orchestrator(&cli)?;
+
+            println!("Running auto-check and fix for task: {}", task_id);
+            let passed = orch.auto_check_and_fix(task_id).await?;
+
+            if passed {
+                println!("✓ Task passed (either initially or after fix)");
+            } else {
+                // Get final validation state
+                let result = orch.validate_multi(task_id).await?;
+                let severity_str = match result.severity {
+                    IssueSeverity::None => "none",
+                    IssueSeverity::Minor => "MINOR",
+                    IssueSeverity::Major => "MAJOR",
+                };
+                println!("✗ Task still failing after fix attempt");
+                println!("  Severity: {}", severity_str);
+                println!("  Passed: {}/{} (threshold: {})", result.passed, result.total, result.threshold);
+            }
+        }
+
         Commands::Stats => {
             let orch = create_orchestrator(&cli)?;
             let stats = orch.stats();
@@ -343,14 +508,21 @@ async fn main() -> Result<()> {
 }
 
 fn init_project(data_dir: &PathBuf) -> Result<()> {
-    std::fs::create_dir_all(data_dir.join("tasks"))?;
-    std::fs::create_dir_all(data_dir.join("results"))?;
-    std::fs::create_dir_all(data_dir.join("contexts"))?;
+    // Only create sessions directory at root level
+    // tasks/results/contexts are created inside each session
+    std::fs::create_dir_all(data_dir.join("sessions"))?;
     Ok(())
 }
 
 fn create_orchestrator(cli: &Cli) -> Result<Orchestrator> {
-    let config = OrchestratorConfig::default();
+    create_orchestrator_with_config(cli, false)
+}
+
+fn create_orchestrator_with_config(cli: &Cli, auto_validate: bool) -> Result<Orchestrator> {
+    let config = OrchestratorConfig {
+        auto_validate,
+        ..OrchestratorConfig::default()
+    };
 
     Orchestrator::new(cli.workdir.clone(), cli.data_dir.clone())
         .map(|o| o.with_config(config))

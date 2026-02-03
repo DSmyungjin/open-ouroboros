@@ -5,14 +5,19 @@ use serde::{Deserialize, Serialize};
 use crate::cli::{CliRunner, CliOptions, Model};
 use crate::dag::{DagManager, DagStats, Task, ContextTree, ExecutionPlan};
 use crate::docs::{DocumentStore, Document, DocType};
+use crate::work_session::{WorkSessionManager, WorkSession};
 
 pub struct Orchestrator {
     cli: CliRunner,
     dag: DagManager,
     docs: DocumentStore,
     config: OrchestratorConfig,
-    data_dir: PathBuf,
+    #[allow(dead_code)]
+    base_data_dir: PathBuf,
+    session_data_dir: PathBuf,
     context_tree: ContextTree,
+    session_mgr: WorkSessionManager,
+    current_session: Option<WorkSession>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,13 +40,13 @@ impl Default for OrchestratorConfig {
     fn default() -> Self {
         Self {
             default_model: Model::Sonnet,
-            validation_model: Model::Opus,
+            validation_model: Model::Sonnet,  // Opus → Sonnet (faster)
             extraction_model: Model::Haiku,
             auto_validate: false,
             max_retries: 3,
-            validation_checks: 3,
-            validation_threshold: 2,  // 2 out of 3 must pass
-            recheck_threshold: 2,
+            validation_checks: 1,             // 3 → 1 (single check)
+            validation_threshold: 1,          // 1 out of 1
+            recheck_threshold: 1,
         }
     }
 }
@@ -57,18 +62,24 @@ pub struct TaskResult {
 impl Orchestrator {
     pub fn new(working_dir: PathBuf, data_dir: PathBuf) -> Result<Self> {
         let cli = CliRunner::new(working_dir.clone());
-        let docs = DocumentStore::new(&data_dir)?;
+        let session_mgr = WorkSessionManager::new(&data_dir)?;
 
-        // Try to load existing DAG
-        let dag_path = data_dir.join("dag.json");
+        // Determine session data directory (current session or base)
+        let session_data_dir = session_mgr.get_session_data_dir(None)
+            .unwrap_or_else(|_| data_dir.clone());
+
+        let docs = DocumentStore::new(&session_data_dir)?;
+
+        // Try to load existing DAG from session
+        let dag_path = session_data_dir.join("dag.json");
         let dag = if DagManager::exists(&dag_path) {
             DagManager::load(&dag_path).unwrap_or_else(|_| DagManager::new())
         } else {
             DagManager::new()
         };
 
-        // Try to load existing context tree
-        let ctx_path = data_dir.join("context-tree.json");
+        // Try to load existing context tree from session
+        let ctx_path = session_data_dir.join("context-tree.json");
         let context_tree = if ctx_path.exists() {
             let content = std::fs::read_to_string(&ctx_path).ok();
             content
@@ -79,13 +90,19 @@ impl Orchestrator {
             ContextTree::new()
         };
 
+        // Load current session if exists
+        let current_session = session_mgr.current_session().ok().flatten();
+
         Ok(Self {
             cli,
             dag,
             docs,
             config: OrchestratorConfig::default(),
-            data_dir,
+            base_data_dir: data_dir,
+            session_data_dir,
             context_tree,
+            session_mgr,
+            current_session,
         })
     }
 
@@ -96,16 +113,55 @@ impl Orchestrator {
 
     /// Save DAG state to file
     pub fn save_dag(&self) -> Result<()> {
-        let dag_path = self.data_dir.join("dag.json");
+        let dag_path = self.session_data_dir.join("dag.json");
         self.dag.save(&dag_path)
     }
 
     /// Save context tree to file
     pub fn save_context_tree(&self) -> Result<()> {
-        let ctx_path = self.data_dir.join("context-tree.json");
+        let ctx_path = self.session_data_dir.join("context-tree.json");
         let state = self.context_tree.to_state();
         let content = serde_json::to_string_pretty(&state)?;
         std::fs::write(&ctx_path, content)?;
+        Ok(())
+    }
+
+    /// Get current session info
+    pub fn current_session(&self) -> Option<&WorkSession> {
+        self.current_session.as_ref()
+    }
+
+    /// List all sessions
+    pub fn list_sessions(&self) -> Result<Vec<crate::work_session::WorkSessionSummary>> {
+        self.session_mgr.list_sessions()
+    }
+
+    /// Switch to a different session
+    pub fn switch_session(&mut self, session_id: &str) -> Result<()> {
+        let session = self.session_mgr.switch_session(session_id)?;
+        self.session_data_dir = self.session_mgr.session_dir(&session.id);
+        self.docs = DocumentStore::new(&self.session_data_dir)?;
+
+        // Reload DAG and context tree
+        let dag_path = self.session_data_dir.join("dag.json");
+        self.dag = if DagManager::exists(&dag_path) {
+            DagManager::load(&dag_path).unwrap_or_else(|_| DagManager::new())
+        } else {
+            DagManager::new()
+        };
+
+        let ctx_path = self.session_data_dir.join("context-tree.json");
+        self.context_tree = if ctx_path.exists() {
+            let content = std::fs::read_to_string(&ctx_path).ok();
+            content
+                .and_then(|c| serde_json::from_str(&c).ok())
+                .map(ContextTree::from_state)
+                .unwrap_or_else(ContextTree::new)
+        } else {
+            ContextTree::new()
+        };
+
+        self.current_session = Some(session);
         Ok(())
     }
 
@@ -119,37 +175,75 @@ impl Orchestrator {
         &mut self.context_tree
     }
 
-    /// Plan: Generate task DAG from a goal
-    pub async fn plan(&mut self, goal: &str) -> Result<Vec<String>> {
+    /// Plan: Generate task DAG from a goal with optional label
+    pub async fn plan_with_label(&mut self, goal: &str, label: Option<String>) -> Result<Vec<String>> {
+        // Create a new work session
+        let session = self.session_mgr.create_session(goal, label)?;
+        let session_id = session.id.clone();
+
+        tracing::info!("Created work session: {} for goal: {}", session_id, goal);
+
+        // Update paths to use new session directory
+        self.session_data_dir = self.session_mgr.session_dir(&session_id);
+        self.docs = DocumentStore::new(&self.session_data_dir)?;
+        self.dag = DagManager::new();
+        self.context_tree = ContextTree::new();
+        self.current_session = Some(session);
+
         // Generate plan ID for session tracking
         let plan_id = format!("plan-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap());
 
         let prompt = format!(
             r#"[PLAN:{}] Task Planning
 
-You are a task planner. Break down this goal into concrete, actionable tasks.
+You are a task planner. Analyze the goal and create the MINIMUM number of tasks needed.
 
 Goal: {}
 
-Output a JSON array of tasks. Each task should have:
-- id: unique identifier (e.g., "task-001")
-- subject: short title
-- description: detailed description of what to do
-- depends_on: array of task IDs this depends on (empty if none)
+## CRITICAL RULES
 
-Example:
-[
-  {{"id": "task-001", "subject": "Analyze requirements", "description": "...", "depends_on": []}},
-  {{"id": "task-002", "subject": "Design architecture", "description": "...", "depends_on": ["task-001"]}}
-]
+1. **DO NOT over-split**: Simple goals should be 1 task. Only split when truly necessary.
+   - "Add ping() method" → 1 task (just implement it)
+   - "Build entire API layer" → multiple tasks (genuinely complex)
 
-Output ONLY the JSON array, no other text."#,
+2. **Skip unnecessary steps**:
+   - Don't create "research" tasks for trivial things
+   - Don't create "design" tasks for simple additions
+   - Don't create separate "test" tasks unless explicitly requested
+
+3. Use "context_fill" tasks ONLY when:
+   - External research is genuinely needed (new library, unfamiliar domain)
+   - Information must be shared across multiple workers
+
+4. Most goals need just 1-2 "worker" tasks.
+
+## Output Format (JSON)
+
+{{
+  "context_nodes": [
+    {{"id": "ctx-root", "parent": null}}
+  ],
+  "tasks": [
+    {{
+      "id": "task-001",
+      "subject": "Short description",
+      "description": "Detailed instructions",
+      "task_type": "worker",
+      "target_node": null,
+      "context_ref": "ctx-root",
+      "depends_on": []
+    }}
+  ]
+}}
+
+Output ONLY the JSON object, no other text."#,
             plan_id, goal
         );
 
         let options = CliOptions {
             model: self.config.default_model,
             print: true,
+            skip_permissions: true,
             ..Default::default()
         };
 
@@ -164,13 +258,75 @@ Output ONLY the JSON array, no other text."#,
         self.docs.create(&plan_meta)?;
 
         // Parse the response
-        let tasks: Vec<PlannedTask> = self.parse_task_json(&output.response)?;
+        let plan: PlannedWorkflow = self.parse_plan_json(&output.response)?;
+
+        // Build context tree
+        self.context_tree = ContextTree::new();
+        let root = self.context_tree.init_root();
+        let root_id = root.node_id.clone();
+
+        // Build a map from plan node IDs to actual node IDs
+        // "ctx-root" in plan -> actual root_id
+        let mut node_id_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        node_id_map.insert("ctx-root".to_string(), root_id.clone());
+
+        // Create context nodes
+        for node in &plan.context_nodes {
+            if node.id == "ctx-root" {
+                continue; // Already created
+            }
+
+            // Resolve parent ID using the map
+            let parent_plan_id = node.parent.as_deref().unwrap_or("ctx-root");
+            let parent_actual_id = node_id_map.get(parent_plan_id)
+                .cloned()
+                .unwrap_or_else(|| root_id.clone());
+
+            if self.context_tree.get(&parent_actual_id).is_some() {
+                // Strip "ctx-" prefix if present (branch_with_ids adds it)
+                let node_base_id = node.id.strip_prefix("ctx-").unwrap_or(&node.id);
+
+                // Create the node
+                let _ = self.context_tree.branch_with_ids(
+                    &parent_actual_id,
+                    "plan",
+                    &[node_base_id],
+                    None,
+                );
+
+                // Map plan node ID to actual node ID
+                let actual_node_id = format!("ctx-{}", node_base_id);
+                node_id_map.insert(node.id.clone(), actual_node_id);
+            }
+        }
 
         // Add tasks to DAG
         let mut task_ids = vec![];
-        for planned in &tasks {
-            let task = Task::new(&planned.subject, &planned.description)
-                .with_id(&planned.id);
+        for planned in &plan.tasks {
+            let task = match planned.task_type.as_str() {
+                "context_fill" => {
+                    let plan_target = planned.target_node.as_deref().unwrap_or("ctx-root");
+                    // Resolve to actual node ID
+                    let actual_target = node_id_map.get(plan_target)
+                        .cloned()
+                        .unwrap_or_else(|| plan_target.to_string());
+                    Task::new_context_fill(&planned.subject, &planned.description, &actual_target)
+                        .with_id(&planned.id)
+                }
+                _ => {
+                    let mut t = Task::new(&planned.subject, &planned.description)
+                        .with_id(&planned.id);
+                    if let Some(ref ctx_ref) = planned.context_ref {
+                        // Resolve to actual node ID
+                        let actual_ref = node_id_map.get(ctx_ref)
+                            .cloned()
+                            .unwrap_or_else(|| ctx_ref.clone());
+                        t = t.with_context_ref(&actual_ref);
+                    }
+                    t
+                }
+            };
+
             self.dag.add_task(task)?;
             task_ids.push(planned.id.clone());
 
@@ -184,17 +340,31 @@ Output ONLY the JSON array, no other text."#,
         }
 
         // Add dependencies
-        for planned in &tasks {
+        for planned in &plan.tasks {
             for dep_id in &planned.depends_on {
                 self.dag.add_dependency(&planned.id, dep_id)?;
             }
         }
 
-        // Save DAG to file
+        // Save DAG and context tree to file
         self.save_dag()?;
+        self.save_context_tree()?;
 
-        tracing::info!("Created {} tasks", task_ids.len());
+        // Update session with task count
+        if let Some(ref mut session) = self.current_session {
+            session.start(task_ids.len());
+            self.session_mgr.update_session_in_index(session)?;
+        }
+
+        tracing::info!("Created {} tasks with {} context nodes in session {}",
+            task_ids.len(), plan.context_nodes.len(),
+            self.current_session.as_ref().map(|s| s.id.as_str()).unwrap_or("none"));
         Ok(task_ids)
+    }
+
+    /// Plan: Generate task DAG from a goal
+    pub async fn plan(&mut self, goal: &str) -> Result<Vec<String>> {
+        self.plan_with_label(goal, None).await
     }
 
     /// Execute a single task
@@ -257,6 +427,7 @@ Output ONLY the JSON array, no other text."#,
         let options = CliOptions {
             model: self.config.default_model,
             print: true,
+            skip_permissions: true,
             system_prompt: Some(context.clone()),
             ..Default::default()
         };
@@ -319,9 +490,30 @@ Output ONLY the JSON array, no other text."#,
         self.save_dag()?;
         self.save_context_tree()?;
 
+        // Auto-validate and fix if enabled (only for successful worker tasks)
+        let final_success = if success && self.config.auto_validate && !task.is_context_fill() {
+            tracing::info!("Auto-validating task: {}", task_id);
+            match self.auto_check_and_fix(task_id).await {
+                Ok(passed) => {
+                    if !passed {
+                        // Update task status to reflect validation failure
+                        self.dag.get_task_mut(task_id).unwrap().fail("Validation failed after fix attempt");
+                        self.save_dag()?;
+                    }
+                    passed
+                }
+                Err(e) => {
+                    tracing::warn!("Auto-validation error for {}: {}", task_id, e);
+                    success // Keep original success on validation error
+                }
+            }
+        } else {
+            success
+        };
+
         Ok(TaskResult {
             task_id: task_id.to_string(),
-            success,
+            success: final_success,
             output: output.response,
             session_id: output.session_id,
         })
@@ -378,8 +570,10 @@ Output ONLY the JSON array, no other text."#,
         self.execute_task(task_id).await
     }
 
-    /// Execute all tasks in dependency order
+    /// Execute all tasks in dependency order (with parallel execution for independent tasks)
     pub async fn execute_all(&mut self) -> Result<Vec<TaskResult>> {
+        use futures::future::join_all;
+
         let mut results = vec![];
 
         loop {
@@ -396,10 +590,196 @@ Output ONLY the JSON array, no other text."#,
                 }
             }
 
-            // Execute ready tasks sequentially (for MVP)
-            for task_id in ready {
-                let result = self.execute_task(&task_id).await?;
+            if ready.len() == 1 {
+                // Single task - execute directly
+                let result = self.execute_task(&ready[0]).await?;
                 results.push(result);
+            } else {
+                // Multiple ready tasks - execute in parallel
+                tracing::info!("Executing {} tasks in parallel", ready.len());
+
+                // Collect task info for parallel execution
+                let tasks_info: Vec<_> = ready.iter()
+                    .filter_map(|tid| {
+                        self.dag.get_task(tid).map(|t| {
+                            (tid.clone(), t.subject.clone(), t.description.clone(),
+                             t.task_type.clone(), t.context_ref.clone(),
+                             t.previous_attempts_context())
+                        })
+                    })
+                    .collect();
+
+                // Mark all as in progress
+                for (task_id, _, _, _, _, _) in &tasks_info {
+                    if let Some(task) = self.dag.get_task_mut(task_id) {
+                        task.start();
+                    }
+                }
+
+                // Get dependency results for context
+                let dep_contexts: Vec<_> = ready.iter()
+                    .map(|tid| {
+                        let dep_ids: Vec<String> = self.dag.dependencies(tid)
+                            .iter()
+                            .map(|t| t.id.clone())
+                            .collect();
+                        self.docs.assemble_context(tid, &dep_ids).unwrap_or_default()
+                    })
+                    .collect();
+
+                // Get context tree docs
+                let ctx_tree_docs: Vec<Vec<std::path::PathBuf>> = tasks_info.iter()
+                    .map(|(_, _, _, _, ctx_ref, _)| {
+                        ctx_ref.as_ref()
+                            .map(|r| self.context_tree.get_docs(r))
+                            .unwrap_or_default()
+                    })
+                    .collect();
+
+                // Spawn parallel tasks
+                let cli = self.cli.clone();
+                let model = self.config.default_model;
+
+                let handles: Vec<_> = tasks_info.into_iter()
+                    .zip(dep_contexts.into_iter())
+                    .zip(ctx_tree_docs.into_iter())
+                    .map(|(((task_id, subject, description, task_type, _, attempts_ctx), dep_ctx), tree_docs)| {
+                        let cli = cli.clone();
+
+                        tokio::spawn(async move {
+                            // Build context
+                            let mut context_parts = vec![];
+
+                            // Context tree docs
+                            if !tree_docs.is_empty() {
+                                let mut tree_context = String::from("# Reference Documents\n\n");
+                                for doc_path in tree_docs {
+                                    if let Ok(content) = std::fs::read_to_string(&doc_path) {
+                                        tree_context.push_str(&format!("## {}\n\n{}\n\n",
+                                            doc_path.display(), content));
+                                    }
+                                }
+                                context_parts.push(tree_context);
+                            }
+
+                            // Dependency context
+                            if !dep_ctx.is_empty() {
+                                context_parts.push(dep_ctx);
+                            }
+
+                            // Previous attempts
+                            if let Some(attempts) = attempts_ctx {
+                                context_parts.push(attempts);
+                            }
+
+                            let context = context_parts.join("\n\n---\n\n");
+
+                            // Build role instruction
+                            use crate::dag::TaskType;
+                            let role_instruction = match &task_type {
+                                TaskType::ContextFill { target_node } => format!(
+                                    "# Role: Context Preparer\n\nYou are preparing reference documents for context node '{}'.\n",
+                                    target_node
+                                ),
+                                TaskType::Worker => String::from(
+                                    "# Role: Implementation Worker\n\nReference documents are provided above.\n"
+                                ),
+                            };
+
+                            let prompt = format!(
+                                "{}\n\n---\n\n{}\n\n---\n\n# Task: {}\n\n{}",
+                                role_instruction, context, subject, description
+                            );
+
+                            let options = CliOptions {
+                                model,
+                                print: true,
+                                skip_permissions: true,
+                                system_prompt: Some(context),
+                                ..Default::default()
+                            };
+
+                            let output = cli.run(&prompt, options).await;
+                            (task_id, subject, task_type, output)
+                        })
+                    })
+                    .collect();
+
+                // Collect results
+                let parallel_results = join_all(handles).await;
+
+                for result in parallel_results {
+                    let (task_id, subject, task_type, output_result) = result
+                        .context("Task execution panicked")?;
+
+                    match output_result {
+                        Ok(output) => {
+                            let success = output.exit_code == 0;
+
+                            // Save result
+                            let result_doc = Document::new(
+                                format!("{}-result", task_id),
+                                DocType::TaskResult,
+                                format!("# Result: {}\n\n{}", subject, output.response),
+                            ).with_task_id(&task_id);
+
+                            let result_path = self.docs.create(&result_doc)?;
+
+                            // Update task status
+                            if let Some(task) = self.dag.get_task_mut(&task_id) {
+                                if success {
+                                    task.complete(Some(result_path.clone()));
+                                } else {
+                                    task.fail("Execution failed");
+                                }
+                            }
+
+                            // Handle context fill task
+                            if let crate::dag::TaskType::ContextFill { ref target_node } = task_type {
+                                if let Some(node) = self.context_tree.get_mut(target_node) {
+                                    node.add_doc(result_path.clone());
+                                }
+                            }
+
+                            // Parse ADD_CONTEXT blocks
+                            let additions = self.parse_context_additions(&output.response);
+                            for (node_id, content) in additions {
+                                let add_doc = Document::new(
+                                    format!("{}-ctx-add-{}", task_id, node_id),
+                                    DocType::Context,
+                                    content,
+                                ).with_task_id(&task_id);
+                                if let Ok(add_path) = self.docs.create(&add_doc) {
+                                    if let Some(node) = self.context_tree.get_mut(&node_id) {
+                                        node.add_doc(add_path);
+                                    }
+                                }
+                            }
+
+                            results.push(TaskResult {
+                                task_id,
+                                success,
+                                output: output.response,
+                                session_id: output.session_id,
+                            });
+                        }
+                        Err(e) => {
+                            if let Some(task) = self.dag.get_task_mut(&task_id) {
+                                task.fail(format!("Error: {}", e));
+                            }
+                            results.push(TaskResult {
+                                task_id,
+                                success: false,
+                                output: format!("Error: {}", e),
+                                session_id: None,
+                            });
+                        }
+                    }
+                }
+
+                // Save state after parallel batch
+                self.save_dag()?;
+                self.save_context_tree()?;
             }
         }
 
@@ -408,6 +788,21 @@ Output ONLY the JSON array, no other text."#,
             "Execution complete: {}/{} succeeded, {} failed",
             stats.completed, stats.total, stats.failed
         );
+
+        // Update session status
+        if let Some(ref mut session) = self.current_session {
+            session.completed_count = stats.completed;
+            session.failed_count = stats.failed;
+            if stats.completed + stats.failed >= stats.total {
+                session.completed_at = Some(chrono::Utc::now());
+                if stats.failed > 0 {
+                    session.status = crate::work_session::WorkSessionStatus::Failed;
+                } else {
+                    session.status = crate::work_session::WorkSessionStatus::Completed;
+                }
+            }
+            self.session_mgr.update_session_in_index(session)?;
+        }
 
         Ok(results)
     }
@@ -440,41 +835,101 @@ Output ONLY the JSON array, no other text."#,
 
     /// Validate a task result using Opus
     pub async fn validate(&self, task_id: &str) -> Result<ValidationResult> {
+        let task = self.dag.get_task(task_id)
+            .ok_or_else(|| anyhow::anyhow!("Task not found: {}", task_id))?;
         let result_doc = self.docs.read_latest_result(task_id)?;
 
         let prompt = format!(
-            r#"Validate this task result:
+            r#"Task that was supposed to be completed:
+{}
 
 {}
 
-Check for:
-1. Completeness: Does it address all requirements?
-2. Accuracy: Are the claims supported?
-3. Consistency: Any contradictions?
-4. Quality: Is it well-structured and clear?
+Execution result:
+{}
 
-Classify severity:
-- "none": All good, no issues
-- "minor": Formatting, docs, style, typos only
-- "major": Missing functionality, broken logic, security issues
+Evaluate whether the result fully meets ALL task requirements.
 
-Respond with JSON:
-{{"approved": true/false, "severity": "none|minor|major", "issues": ["issue1", ...], "suggestions": ["suggestion1", ...]}}"#,
+Guidelines:
+- Focus on the END RESULT, not whether changes were made
+- PASS if the current state satisfies ALL requirements completely
+- FAIL if ANY requirement is not met or only partially addressed
+- Check EVERY requirement mentioned in the task
+
+Issue Classification (when FAIL):
+- MINOR issues: formatting, style, comments, typos, cosmetic improvements
+- MAJOR issues: missing functionality, broken logic, security issues, core requirements not met,
+  BLOCKED by permissions or resources (e.g., "I need permission to write files")
+
+At the end, provide your verdict:
+1. If PASS: Write "VERDICT: PASS"
+2. If FAIL with only MINOR issues: Write "VERDICT: FAIL_MINOR" then "MINOR_ISSUES:" with list
+3. If FAIL with any MAJOR issues: Write "VERDICT: FAIL_MAJOR" then "MAJOR_ISSUES:" with list"#,
+            task.subject,
+            task.description,
             result_doc.content
         );
 
         let output = self.cli.validate(&prompt).await?;
 
-        // Parse validation result (extract JSON from response)
-        let validation: ValidationResult = self.parse_validation_json(&output.response)
-            .unwrap_or(ValidationResult {
-                approved: false,
-                severity: IssueSeverity::Major,
-                issues: vec!["Failed to parse validation response".to_string()],
-                suggestions: vec![],
-            });
+        // Parse VERDICT-based response
+        let validation = self.parse_verdict_response(&output.response);
 
         Ok(validation)
+    }
+
+    /// Parse VERDICT-based validation response
+    fn parse_verdict_response(&self, response: &str) -> ValidationResult {
+        let upper = response.to_uppercase();
+
+        if upper.contains("VERDICT: PASS") {
+            ValidationResult {
+                approved: true,
+                severity: IssueSeverity::None,
+                issues: vec![],
+                suggestions: vec![],
+            }
+        } else if upper.contains("VERDICT: FAIL_MINOR") {
+            let minor_issues = self.extract_issues(response, "MINOR_ISSUES:");
+            ValidationResult {
+                approved: false,
+                severity: IssueSeverity::Minor,
+                issues: minor_issues,
+                suggestions: vec![],
+            }
+        } else {
+            // FAIL_MAJOR or unrecognized = treat as major
+            let major_issues = self.extract_issues(response, "MAJOR_ISSUES:");
+            ValidationResult {
+                approved: false,
+                severity: IssueSeverity::Major,
+                issues: if major_issues.is_empty() {
+                    vec!["Validation failed".to_string()]
+                } else {
+                    major_issues
+                },
+                suggestions: vec![],
+            }
+        }
+    }
+
+    /// Extract issues from response after a marker
+    fn extract_issues(&self, response: &str, marker: &str) -> Vec<String> {
+        let lower = response.to_lowercase();
+        let marker_lower = marker.to_lowercase();
+
+        if let Some(start) = lower.find(&marker_lower) {
+            let rest = &response[start + marker.len()..];
+            rest.lines()
+                .map(|l| l.trim())
+                .take_while(|l| !l.is_empty() || l.starts_with('-') || l.starts_with('*'))
+                .filter(|l| l.starts_with('-') || l.starts_with('*'))
+                .map(|l| l.trim_start_matches('-').trim_start_matches('*').trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        } else {
+            vec![]
+        }
     }
 
     /// Multi-pass validation: run N checks in parallel, require threshold to pass
@@ -500,37 +955,43 @@ Respond with JSON:
             num_checks, task_id, threshold
         );
 
-        // Spawn validation tasks
+        let task = self.dag.get_task(task_id)
+            .ok_or_else(|| anyhow::anyhow!("Task not found: {}", task_id))?
+            .clone();
         let result_doc = self.docs.read_latest_result(task_id)?;
         let content = result_doc.content.clone();
+        let subject = task.subject.clone();
+        let description = task.description.clone();
 
         let mut handles = vec![];
         for i in 1..=num_checks {
             let cli = self.cli.clone();
             let content = content.clone();
+            let subject = subject.clone();
+            let description = description.clone();
 
             let handle = tokio::spawn(async move {
                 let prompt = format!(
                     r#"[Validation Check #{}/{}]
 
-Validate this task result:
+Task: {}
 
 {}
 
-Check for:
-1. Completeness: Does it address all requirements?
-2. Accuracy: Are the claims supported?
-3. Consistency: Any contradictions?
-4. Quality: Is it well-structured and clear?
+Execution result:
+{}
 
-Classify severity:
-- "none": All good, no issues
-- "minor": Formatting, docs, style, typos only
-- "major": Missing functionality, broken logic, security issues
+Evaluate whether the result fully meets ALL task requirements.
 
-Respond with JSON:
-{{"approved": true/false, "severity": "none|minor|major", "issues": ["issue1", ...], "suggestions": ["suggestion1", ...]}}"#,
-                    i, num_checks, content
+Issue Classification (when FAIL):
+- MINOR: formatting, style, comments, typos, cosmetic
+- MAJOR: missing functionality, broken logic, security, BLOCKED by permissions
+
+Verdict format:
+1. PASS: "VERDICT: PASS"
+2. FAIL_MINOR: "VERDICT: FAIL_MINOR" then "MINOR_ISSUES:" with list
+3. FAIL_MAJOR: "VERDICT: FAIL_MAJOR" then "MAJOR_ISSUES:" with list"#,
+                    i, num_checks, subject, description, content
                 );
 
                 let output = cli.validate(&prompt).await;
@@ -553,13 +1014,7 @@ Respond with JSON:
 
             let validation = match output_result {
                 Ok(output) => {
-                    self.parse_validation_json(&output.response)
-                        .unwrap_or(ValidationResult {
-                            approved: false,
-                            severity: IssueSeverity::Major,
-                            issues: vec!["Failed to parse validation response".to_string()],
-                            suggestions: vec![],
-                        })
+                    self.parse_verdict_response(&output.response)
                 }
                 Err(e) => {
                     tracing::warn!("Validation check #{} failed: {}", check_num, e);
@@ -614,6 +1069,241 @@ Respond with JSON:
             self.config.validation_checks,
             self.config.recheck_threshold,
         ).await
+    }
+
+    /// Auto-check and fix: validate task result and run appropriate fixer if needed
+    /// Returns true if task passed (either initially or after fix)
+    pub async fn auto_check_and_fix(&mut self, task_id: &str) -> Result<bool> {
+        // Step 1: Run multi-pass validation
+        let validation = self.validate_multi(task_id).await?;
+
+        if validation.approved {
+            tracing::info!("Task {} passed validation", task_id);
+            return Ok(true);
+        }
+
+        tracing::info!(
+            "Task {} failed validation: {:?} issues",
+            task_id, validation.severity
+        );
+
+        // Step 2: Run appropriate fixer based on severity
+        let fix_result = match validation.severity {
+            IssueSeverity::Major => {
+                self.run_major_fixer(task_id, &validation).await?
+            }
+            IssueSeverity::Minor => {
+                self.run_minor_fixer(task_id, &validation).await?
+            }
+            IssueSeverity::None => {
+                // Shouldn't happen if not approved, but handle gracefully
+                return Ok(true);
+            }
+        };
+
+        // Step 3: Save fix result
+        let fix_doc = Document::new(
+            format!("{}-fix", task_id),
+            DocType::Context,
+            format!("# Fix Result\n\n## How\n{}\n\n## Result\n{}",
+                fix_result.how, fix_result.result),
+        ).with_task_id(task_id);
+        self.docs.create(&fix_doc)?;
+
+        // Step 4: Recheck with potentially lower threshold
+        let recheck = self.recheck(task_id).await?;
+
+        if recheck.approved {
+            tracing::info!("Task {} passed recheck after fix", task_id);
+            Ok(true)
+        } else {
+            tracing::warn!(
+                "Task {} still failing after fix: {:?}",
+                task_id, recheck.severity
+            );
+            // Record for potential retry
+            let combined = ValidationResult {
+                approved: false,
+                severity: recheck.severity,
+                issues: recheck.checks.iter()
+                    .flat_map(|c| c.issues.clone())
+                    .collect(),
+                suggestions: vec![],
+            };
+            self.record_failed_attempt(task_id, &fix_result.result, &combined)?;
+            Ok(false)
+        }
+    }
+
+    /// Run MajorFixer: full authority to fix logic, functionality, etc.
+    async fn run_major_fixer(
+        &self,
+        task_id: &str,
+        validation: &MultiValidationResult,
+    ) -> Result<FixerOutput> {
+        let task = self.dag.get_task(task_id)
+            .ok_or_else(|| anyhow::anyhow!("Task not found: {}", task_id))?
+            .clone();
+        let result_doc = self.docs.read_latest_result(task_id)?;
+
+        // Collect all issues from validation checks
+        let major_issues: Vec<String> = validation.checks.iter()
+            .filter(|c| c.severity == IssueSeverity::Major)
+            .flat_map(|c| c.issues.clone())
+            .collect();
+        let minor_issues: Vec<String> = validation.checks.iter()
+            .filter(|c| c.severity == IssueSeverity::Minor)
+            .flat_map(|c| c.issues.clone())
+            .collect();
+
+        let minor_section = if minor_issues.is_empty() {
+            String::new()
+        } else {
+            format!("\n\n## Minor issues (fix these too if possible):\n- {}",
+                minor_issues.join("\n- "))
+        };
+
+        let prompt = format!(
+            r#"# MajorFixer Task
+
+## Original Task
+{}
+
+## Task Description
+{}
+
+## Current Result
+{}
+
+## Major Issues to Fix
+- {}{}
+
+## Your Authority
+You have FULL AUTHORITY to:
+- Modify logic and functionality
+- Add missing features
+- Fix bugs and security issues
+- Make architectural adjustments
+- Implement missing requirements
+- Refactor code as needed
+
+## Output Format
+Provide your fix with these sections:
+
+===HOW===
+Explain what you changed and why.
+
+===RESULT===
+Summary of the fixes applied."#,
+            task.subject,
+            task.description,
+            result_doc.content,
+            major_issues.join("\n- "),
+            minor_section
+        );
+
+        let options = CliOptions {
+            model: Model::Opus,
+            print: true,
+            skip_permissions: true,
+            ..Default::default()
+        };
+
+        let output = self.cli.run(&prompt, options).await?;
+        self.parse_fixer_output(&output.response)
+    }
+
+    /// Run MinorFixer: cosmetic fixes only (formatting, style, docs)
+    async fn run_minor_fixer(
+        &self,
+        task_id: &str,
+        validation: &MultiValidationResult,
+    ) -> Result<FixerOutput> {
+        let task = self.dag.get_task(task_id)
+            .ok_or_else(|| anyhow::anyhow!("Task not found: {}", task_id))?
+            .clone();
+        let result_doc = self.docs.read_latest_result(task_id)?;
+
+        let minor_issues: Vec<String> = validation.checks.iter()
+            .filter(|c| c.severity == IssueSeverity::Minor)
+            .flat_map(|c| c.issues.clone())
+            .collect();
+
+        let prompt = format!(
+            r#"# MinorFixer Task
+
+## Original Task
+{}
+
+## Task Description
+{}
+
+## Current Result
+{}
+
+## Minor Issues to Fix
+- {}
+
+## Your Authority (LIMITED)
+You may ONLY fix:
+- Formatting problems (indentation, spacing)
+- Style inconsistencies
+- Missing comments/documentation
+- Typos
+- Cosmetic improvements
+
+You may NOT:
+- Change any logic or functionality
+- Add new features
+- Fix bugs requiring logic changes
+- Make architectural changes
+
+## Output Format
+Provide your fix with these sections:
+
+===HOW===
+Explain what cosmetic changes you made.
+
+===RESULT===
+Summary of the minor fixes applied."#,
+            task.subject,
+            task.description,
+            result_doc.content,
+            minor_issues.join("\n- ")
+        );
+
+        let options = CliOptions {
+            model: Model::Sonnet,
+            print: true,
+            skip_permissions: true,
+            ..Default::default()
+        };
+
+        let output = self.cli.run(&prompt, options).await?;
+        self.parse_fixer_output(&output.response)
+    }
+
+    /// Parse fixer output into FixerOutput struct
+    fn parse_fixer_output(&self, output: &str) -> Result<FixerOutput> {
+        let how_marker = "===HOW===";
+        let result_marker = "===RESULT===";
+
+        let how_start = output.find(how_marker);
+        let result_start = output.find(result_marker);
+
+        let (how, result) = match (how_start, result_start) {
+            (Some(h), Some(r)) if h < r => {
+                let how = output[h + how_marker.len()..r].trim().to_string();
+                let result = output[r + result_marker.len()..].trim().to_string();
+                (how, result)
+            }
+            _ => {
+                // Fallback: use full output as both
+                (output.to_string(), output.to_string())
+            }
+        };
+
+        Ok(FixerOutput { how, result })
     }
 
     /// Get DAG statistics
@@ -727,6 +1417,7 @@ This will be saved and made available to other tasks referencing that context no
         )
     }
 
+    #[allow(dead_code)]
     fn parse_task_json(&self, response: &str) -> Result<Vec<PlannedTask>> {
         // Try to extract JSON array from response
         let json_str = if let Some(start) = response.find('[') {
@@ -743,7 +1434,7 @@ This will be saved and made available to other tasks referencing that context no
             .context("Failed to parse task JSON from response")
     }
 
-    fn parse_validation_json(&self, response: &str) -> Result<ValidationResult> {
+    fn parse_plan_json(&self, response: &str) -> Result<PlannedWorkflow> {
         // Try to extract JSON object from response
         let json_str = if let Some(start) = response.find('{') {
             if let Some(end) = response.rfind('}') {
@@ -755,9 +1446,59 @@ This will be saved and made available to other tasks referencing that context no
             response
         };
 
-        serde_json::from_str(json_str)
-            .context("Failed to parse validation JSON from response")
+        // Try parsing as full workflow first
+        if let Ok(workflow) = serde_json::from_str::<PlannedWorkflow>(json_str) {
+            return Ok(workflow);
+        }
+
+        // Fallback: try parsing as simple task array (backward compatibility)
+        if let Ok(tasks) = serde_json::from_str::<Vec<PlannedTask>>(json_str) {
+            return Ok(PlannedWorkflow {
+                context_nodes: vec![PlannedContextNode {
+                    id: "ctx-root".to_string(),
+                    parent: None,
+                }],
+                tasks,
+            });
+        }
+
+        // Try extracting array if object parsing failed
+        let array_str = if let Some(start) = response.find('[') {
+            if let Some(end) = response.rfind(']') {
+                &response[start..=end]
+            } else {
+                json_str
+            }
+        } else {
+            json_str
+        };
+
+        let tasks: Vec<PlannedTask> = serde_json::from_str(array_str)
+            .context("Failed to parse plan JSON from response")?;
+
+        Ok(PlannedWorkflow {
+            context_nodes: vec![PlannedContextNode {
+                id: "ctx-root".to_string(),
+                parent: None,
+            }],
+            tasks,
+        })
     }
+
+}
+
+/// Planned workflow with context tree and tasks
+#[derive(Debug, Deserialize)]
+struct PlannedWorkflow {
+    #[serde(default)]
+    context_nodes: Vec<PlannedContextNode>,
+    tasks: Vec<PlannedTask>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlannedContextNode {
+    id: String,
+    parent: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -765,8 +1506,18 @@ struct PlannedTask {
     id: String,
     subject: String,
     description: String,
+    #[serde(default = "default_task_type")]
+    task_type: String,
+    #[serde(default)]
+    target_node: Option<String>,
+    #[serde(default)]
+    context_ref: Option<String>,
     #[serde(default)]
     depends_on: Vec<String>,
+}
+
+fn default_task_type() -> String {
+    "worker".to_string()
 }
 
 /// Issue severity classification for targeted fixing
@@ -797,6 +1548,13 @@ pub struct MultiValidationResult {
     pub approved: bool,
     pub severity: IssueSeverity,
     pub checks: Vec<ValidationResult>,
+}
+
+/// Output from MajorFixer or MinorFixer
+#[derive(Debug, Clone)]
+pub struct FixerOutput {
+    pub how: String,
+    pub result: String,
 }
 
 #[cfg(test)]

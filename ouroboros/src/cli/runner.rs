@@ -35,6 +35,8 @@ pub struct CliOptions {
     pub resume: Option<String>,
     pub system_prompt: Option<String>,
     pub allowed_tools: Option<Vec<String>>,
+    /// Skip permission prompts (dangerous but needed for automation)
+    pub skip_permissions: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +73,11 @@ impl CliRunner {
         // Add options
         if options.print {
             cmd.arg("--print");
+        }
+
+        // Always skip permissions for automation
+        if options.skip_permissions {
+            cmd.arg("--dangerously-skip-permissions");
         }
 
         cmd.arg("--model").arg(options.model.as_str());
