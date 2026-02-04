@@ -55,12 +55,8 @@ pub struct DocumentStore {
 impl DocumentStore {
     pub fn new(base_dir: impl Into<PathBuf>) -> Result<Self> {
         let base_dir = base_dir.into();
-
-        // Create subdirectories
-        for subdir in ["tasks", "results", "contexts"] {
-            fs::create_dir_all(base_dir.join(subdir))?;
-        }
-
+        // Don't create subdirectories here - they're created lazily in create()
+        // or explicitly by WorkSessionManager when creating a session
         Ok(Self { base_dir })
     }
 
@@ -73,8 +69,12 @@ impl DocumentStore {
             DocType::ValidationReport => "results",
         };
 
+        let subdir_path = self.base_dir.join(subdir);
+        // Create subdirectory lazily if it doesn't exist
+        fs::create_dir_all(&subdir_path)?;
+
         let filename = format!("{}.md", doc.id);
-        let path = self.base_dir.join(subdir).join(&filename);
+        let path = subdir_path.join(&filename);
 
         let content = self.serialize_document(doc)?;
         fs::write(&path, content)?;
