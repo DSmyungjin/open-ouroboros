@@ -5,12 +5,14 @@ use serde::{Deserialize, Serialize};
 use crate::cli::{CliRunner, CliOptions, Model};
 use crate::dag::{DagManager, DagStats, Task, ContextTree, ExecutionPlan};
 use crate::docs::{DocumentStore, Document, DocType};
+use crate::search::SearchEngine;
 use crate::work_session::{WorkSessionManager, WorkSession};
 
 pub struct Orchestrator {
     cli: CliRunner,
     dag: DagManager,
     docs: DocumentStore,
+    search: Option<SearchEngine>,
     config: OrchestratorConfig,
     #[allow(dead_code)]
     base_data_dir: PathBuf,
@@ -34,6 +36,12 @@ pub struct OrchestratorConfig {
     pub validation_threshold: u32,
     /// Threshold for post-fix recheck (can be lower than initial)
     pub recheck_threshold: u32,
+    /// Enable auto-search injection before task execution
+    pub auto_search_enabled: bool,
+    /// Maximum number of auto-search results to inject
+    pub auto_search_max_results: usize,
+    /// Minimum score threshold for auto-search results
+    pub auto_search_min_score: f32,
 }
 
 impl Default for OrchestratorConfig {
@@ -47,6 +55,9 @@ impl Default for OrchestratorConfig {
             validation_checks: 1,             // 3 → 1 (single check)
             validation_threshold: 1,          // 1 out of 1
             recheck_threshold: 1,
+            auto_search_enabled: true,        // Enable by default
+            auto_search_max_results: 5,       // Top 5 results
+            auto_search_min_score: 0.3,       // Minimum relevance
         }
     }
 }
@@ -93,10 +104,15 @@ impl Orchestrator {
         // Load current session if exists
         let current_session = session_mgr.current_session().ok().flatten();
 
+        // Initialize search engine (keyword-only mode)
+        let search_path = session_data_dir.join("search_index");
+        let search = SearchEngine::keyword_only(&search_path).ok();
+
         Ok(Self {
             cli,
             dag,
             docs,
+            search,
             config: OrchestratorConfig::default(),
             base_data_dir: data_dir,
             session_data_dir,
@@ -190,6 +206,10 @@ impl Orchestrator {
         self.context_tree = ContextTree::new();
         self.current_session = Some(session);
 
+        // Reinitialize search engine for new session directory
+        let search_path = self.session_data_dir.join("search_index");
+        self.search = SearchEngine::keyword_only(&search_path).ok();
+
         // Generate plan ID for session tracking
         let plan_id = format!("plan-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap());
 
@@ -244,6 +264,7 @@ Output ONLY the JSON object, no other text."#,
             model: self.config.default_model,
             print: true,
             skip_permissions: true,
+            system_prompt: Some("You are a task planner that outputs ONLY valid JSON. No explanations, no markdown formatting, just raw JSON.".to_string()),
             ..Default::default()
         };
 
@@ -337,6 +358,19 @@ Output ONLY the JSON object, no other text."#,
                 format!("# {}\n\n{}", planned.subject, planned.description),
             ).with_task_id(&planned.id);
             self.docs.create(&doc)?;
+
+            // Index task for search
+            if let Some(ref mut search) = self.search {
+                let session_id = self.current_session.as_ref().map(|s| s.id.as_str());
+                if let Err(e) = search.index_task(
+                    &planned.id,
+                    &planned.subject,
+                    &planned.description,
+                    session_id,
+                ).await {
+                    tracing::warn!("Failed to index task: {}", e);
+                }
+            }
         }
 
         // Add dependencies
@@ -419,6 +453,22 @@ Output ONLY the JSON object, no other text."#,
             context_parts.push(attempts_ctx);
         }
 
+        // Auto-search for relevant knowledge (inject at the top)
+        if self.config.auto_search_enabled {
+            match self.auto_search_for_task(&task).await {
+                Ok(auto_knowledge) if !auto_knowledge.is_empty() => {
+                    tracing::info!("Injecting {} bytes of auto-discovered knowledge",
+                        auto_knowledge.len());
+                    // Insert at the beginning so it appears first
+                    context_parts.insert(0, auto_knowledge);
+                }
+                Err(e) => {
+                    tracing::warn!("Auto-search failed: {}", e);
+                }
+                _ => {}
+            }
+        }
+
         let context = context_parts.join("\n\n---\n\n");
 
         // Build prompt with role-specific instructions
@@ -452,6 +502,14 @@ Output ONLY the JSON object, no other text."#,
 
         let result_path = self.docs.create(&result_doc)?;
 
+        // Index task result for search
+        if let Some(ref mut search) = self.search {
+            let session_id = self.current_session.as_ref().map(|s| s.id.as_str());
+            if let Err(e) = search.index_task_result(task_id, &output.response, session_id).await {
+                tracing::warn!("Failed to index task result: {}", e);
+            }
+        }
+
         // Update task status
         if success {
             self.dag.get_task_mut(task_id).unwrap().complete(Some(result_path.clone()));
@@ -467,13 +525,28 @@ Output ONLY the JSON object, no other text."#,
             // Parse and save any [ADD_CONTEXT:node_id] blocks from output
             let context_additions = self.parse_context_additions(&output.response);
             for (node_id, content) in context_additions {
+                let doc_id = format!("{}-ctx-add-{}", task_id, node_id);
                 let add_doc = Document::new(
-                    format!("{}-ctx-add-{}", task_id, node_id),
+                    &doc_id,
                     DocType::Context,
-                    content,
+                    content.clone(),
                 ).with_task_id(task_id);
 
                 let add_path = self.docs.create(&add_doc)?;
+
+                // Index context for search
+                if let Some(ref mut search) = self.search {
+                    let session_id = self.current_session.as_ref().map(|s| s.id.as_str());
+                    if let Err(e) = search.index_context(
+                        &doc_id,
+                        &format!("Context: {}", node_id),
+                        &content,
+                        session_id,
+                        Some(task_id),
+                    ).await {
+                        tracing::warn!("Failed to index context: {}", e);
+                    }
+                }
 
                 if let Some(node) = self.context_tree.get_mut(&node_id) {
                     node.add_doc(add_path.clone());
@@ -489,6 +562,22 @@ Output ONLY the JSON object, no other text."#,
         // Save DAG and context tree state
         self.save_dag()?;
         self.save_context_tree()?;
+
+        // Update session status
+        if let Some(ref mut session) = self.current_session {
+            let stats = self.dag.stats();
+            session.completed_count = stats.completed;
+            session.failed_count = stats.failed;
+            if stats.completed + stats.failed >= stats.total && stats.total > 0 {
+                session.completed_at = Some(chrono::Utc::now());
+                if stats.failed == 0 {
+                    session.status = crate::work_session::WorkSessionStatus::Completed;
+                } else {
+                    session.status = crate::work_session::WorkSessionStatus::Failed;
+                }
+            }
+            self.session_mgr.update_session_in_index(session)?;
+        }
 
         // Auto-validate and fix if enabled (only for successful worker tasks)
         let final_success = if success && self.config.auto_validate && !task.is_context_fill() {
@@ -839,22 +928,57 @@ Output ONLY the JSON object, no other text."#,
             .ok_or_else(|| anyhow::anyhow!("Task not found: {}", task_id))?;
         let result_doc = self.docs.read_latest_result(task_id)?;
 
+        // Get plan context (task description serves as plan)
+        let plan = &task.description;
+
+        // Get dependencies' context for additional understanding
+        let dep_ids: Vec<String> = self.dag.dependencies(task_id)
+            .iter()
+            .map(|t| t.id.clone())
+            .collect();
+        let dependency_context = self.docs.assemble_context(task_id, &dep_ids)
+            .unwrap_or_default();
+
+        // Get context tree docs if available
+        let context_docs = if let Some(ref ctx_ref) = task.context_ref {
+            let docs = self.context_tree.get_docs(ctx_ref);
+            if !docs.is_empty() {
+                let mut ctx = String::new();
+                for doc_path in docs {
+                    if let Ok(content) = std::fs::read_to_string(&doc_path) {
+                        ctx.push_str(&format!("### {}\n{}\n\n", doc_path.display(), content));
+                    }
+                }
+                ctx
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+
         let prompt = format!(
-            r#"Task that was supposed to be completed:
+            r#"# Task that was supposed to be completed
 {}
 
+# Plan (what was supposed to be done)
 {}
 
-Execution result:
+# Context (reference documents and dependencies)
+{}
 {}
 
-Evaluate whether the result fully meets ALL task requirements.
+# Execution Result (how it was done + outcome)
+{}
+
+Evaluate whether the CURRENT STATE fully meets ALL task requirements.
 
 Guidelines:
 - Focus on the END RESULT, not whether changes were made
 - PASS if the current state satisfies ALL requirements completely
 - FAIL if ANY requirement is not met or only partially addressed
 - Check EVERY requirement mentioned in the task
+- Verify the approach taken was appropriate for the task
 
 Issue Classification (when FAIL):
 - MINOR issues: formatting, style, comments, typos, cosmetic improvements
@@ -866,7 +990,9 @@ At the end, provide your verdict:
 2. If FAIL with only MINOR issues: Write "VERDICT: FAIL_MINOR" then "MINOR_ISSUES:" with list
 3. If FAIL with any MAJOR issues: Write "VERDICT: FAIL_MAJOR" then "MAJOR_ISSUES:" with list"#,
             task.subject,
-            task.description,
+            plan,
+            context_docs,
+            dependency_context,
             result_doc.content
         );
 
@@ -1350,6 +1476,132 @@ Summary of the minor fixes applied."#,
         additions
     }
 
+    /// Extract keywords from task for auto-search
+    fn extract_keywords(&self, subject: &str, description: &str) -> Vec<String> {
+        // Combine subject and description
+        let text = format!("{} {}", subject, description);
+
+        // Simple keyword extraction: split by whitespace and punctuation
+        // Filter out common stop words and short words
+        let stop_words = [
+            "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+            "have", "has", "had", "do", "does", "did", "will", "would", "could",
+            "should", "may", "might", "must", "and", "or", "but", "if", "then",
+            "else", "when", "where", "why", "how", "what", "which", "who", "whom",
+            "this", "that", "these", "those", "it", "its", "for", "from", "to",
+            "of", "in", "on", "at", "by", "with", "about", "into", "through",
+            "를", "을", "이", "가", "은", "는", "에", "의", "로", "으로", "와", "과",
+            "도", "만", "까지", "부터", "에서", "한다", "하는", "하고", "하여",
+        ];
+
+        let keywords: Vec<String> = text
+            .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| s.len() >= 2 && !stop_words.contains(&s.as_str()))
+            .collect::<std::collections::HashSet<_>>()  // Deduplicate
+            .into_iter()
+            .take(10)  // Limit to 10 keywords
+            .collect();
+
+        keywords
+    }
+
+    /// Auto-search for relevant knowledge before task execution
+    /// Searches across ALL sessions for relevant knowledge
+    async fn auto_search_for_task(&self, task: &crate::dag::Task) -> Result<String> {
+        // Extract keywords from task
+        let keywords = self.extract_keywords(&task.subject, &task.description);
+        if keywords.is_empty() {
+            return Ok(String::new());
+        }
+
+        // Build search query from keywords
+        let query = keywords.join(" ");
+        tracing::debug!("Auto-search query: {}", query);
+
+        // Search across all sessions
+        let mut all_results = Vec::new();
+
+        // Get all session directories
+        let sessions = self.session_mgr.list_sessions()?;
+        for session_summary in &sessions {
+            let session_dir = self.session_mgr.session_dir(&session_summary.id);
+            let search_index_path = session_dir.join("search_index");
+
+            if !search_index_path.exists() {
+                continue;
+            }
+
+            // Create read-only search engine for this session
+            match crate::search::SearchEngine::keyword_reader_only(&search_index_path) {
+                Ok(session_search) => {
+                    let options = crate::search::SearchOptions::new()
+                        .with_limit(self.config.auto_search_max_results)
+                        .with_min_score(self.config.auto_search_min_score);
+
+                    match session_search.search(&query, &options).await {
+                        Ok(results) => {
+                            for mut result in results {
+                                // Add session info to title for context
+                                result.title = format!("[{}] {}",
+                                    session_summary.id.chars().take(10).collect::<String>(),
+                                    result.title);
+                                all_results.push(result);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!("Search failed for session {}: {}", session_summary.id, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("Failed to open search index for session {}: {}", session_summary.id, e);
+                }
+            }
+        }
+
+        // Sort by score and limit results
+        all_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        let results: Vec<_> = all_results.into_iter()
+            .take(self.config.auto_search_max_results)
+            .collect();
+
+        if results.is_empty() {
+            tracing::debug!("Auto-search found no results");
+            return Ok(String::new());
+        }
+
+        tracing::info!("Auto-search found {} relevant documents for task {}",
+            results.len(), task.id);
+
+        // Format results as context
+        let mut output = String::from("## 📚 Auto-Discovered Knowledge\n\n");
+        output.push_str("아래는 이 태스크와 관련된 기존 지식입니다. 참고하여 작업하세요.\n\n");
+        output.push_str("---\n\n");
+
+        for result in results {
+            let doc_type = result.doc_type.as_str();
+            let score = (result.score * 100.0) as u32;
+
+            output.push_str(&format!("### [{}] {}\n", doc_type, result.title));
+
+            // Truncate content if too long (max 500 chars)
+            let content_preview = if result.content.chars().count() > 500 {
+                format!("{}...", result.content.chars().take(500).collect::<String>())
+            } else {
+                result.content.clone()
+            };
+
+            output.push_str(&format!("> {}\n", content_preview.replace('\n', "\n> ")));
+            output.push_str(&format!("> **관련도: {}%**\n\n", score));
+            output.push_str("---\n\n");
+        }
+
+        output.push_str(&format!("검색어: \"{}\"\n\n", keywords.join("\", \"")));
+
+        Ok(output)
+    }
+
     /// Build task prompt with role-specific instructions
     fn build_task_prompt(&self, task: &Task, context: &str) -> String {
         use crate::dag::TaskType;
@@ -1367,6 +1619,16 @@ Your output will be used by downstream worker tasks.
 - Focus on facts and references that workers will need
 - Be thorough - workers will rely on what you provide
 
+## Searching Past Knowledge
+Before researching externally, search the knowledge base for relevant information:
+```bash
+# Search all sessions for relevant knowledge
+ouroboros search "keyword" --all
+
+# Filter by knowledge entries
+ouroboros search "keyword" -t knowledge --all
+```
+
 ## Output Format
 Produce a well-organized document with clear sections.
 "#,
@@ -1383,11 +1645,30 @@ Reference documents are provided above. Use them as your primary source.
 - Focus on implementation based on available information
 - If context is insufficient for a specific part:
   - Do NOT guess or make assumptions
-  - Spawn a research sub-agent to gather what you need
+  - Search past knowledge or spawn a research sub-agent
 - Keep your work focused on the task at hand
 
+## Searching Past Knowledge
+Before researching externally, search the knowledge base for relevant information:
+```bash
+# Search current session
+ouroboros search "keyword"
+
+# Search all sessions
+ouroboros search "keyword" --all
+
+# Filter by document type
+ouroboros search "keyword" -t knowledge
+ouroboros search "keyword" -t task_result
+```
+
+Use search when:
+- You need reference to past implementations
+- Looking for design decisions or patterns used before
+- Finding related task results or knowledge entries
+
 ## Sub-Agent Usage
-When you need additional information not in the context:
+When you need NEW information not in context or search results:
 ```
 [SPAWN:research] Query: <what you need to know>
 ```
