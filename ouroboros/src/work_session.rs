@@ -49,12 +49,12 @@ pub struct WorkSession {
 }
 
 impl WorkSession {
-    /// Create a new work session
-    pub fn new(goal: impl Into<String>, label: Option<String>) -> Self {
-        let id = generate_short_id();
+    /// Create a new work session with sequence number
+    pub fn new(goal: impl Into<String>, label: Option<String>, seq: u32) -> Self {
+        let hash = generate_short_id();
         let full_id = match &label {
-            Some(l) => format!("{}-{}", id, sanitize_label(l)),
-            None => id,
+            Some(l) => format!("{:03}-{}-{}", seq, hash, sanitize_label(l)),
+            None => format!("{:03}-{}", seq, hash),
         };
 
         Self {
@@ -70,10 +70,11 @@ impl WorkSession {
         }
     }
 
-    /// Get the short ID (first 6 chars)
+    /// Get the short ID (sequence + hash, e.g., "001-abc123")
     pub fn short_id(&self) -> &str {
-        if self.id.len() > 6 {
-            &self.id[..6]
+        // Format: "001-abc123-label" -> return "001-abc123" (10 chars)
+        if self.id.len() >= 10 {
+            &self.id[..10]
         } else {
             &self.id
         }
@@ -234,7 +235,11 @@ impl WorkSessionManager {
 
     /// Create a new session
     pub fn create_session(&self, goal: &str, label: Option<String>) -> Result<WorkSession> {
-        let session = WorkSession::new(goal, label);
+        // Get next sequence number from index
+        let index = self.load_index()?;
+        let next_seq = (index.sessions.len() as u32) + 1;
+
+        let session = WorkSession::new(goal, label, next_seq);
 
         // Create session directory structure
         let session_dir = self.session_dir(&session.id);
@@ -440,7 +445,7 @@ mod tests {
 
     #[test]
     fn test_session_lifecycle() {
-        let mut session = WorkSession::new("Test", None);
+        let mut session = WorkSession::new("Test", None, 1);
         assert_eq!(session.status, WorkSessionStatus::Pending);
 
         session.start(3);
@@ -458,7 +463,7 @@ mod tests {
 
     #[test]
     fn test_session_failure() {
-        let mut session = WorkSession::new("Test", None);
+        let mut session = WorkSession::new("Test", None, 1);
         session.start(2);
 
         session.record_completion(true);

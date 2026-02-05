@@ -95,6 +95,51 @@ enum Commands {
         #[arg(short, long)]
         search: Option<String>,
     },
+
+    /// Search indexed documents
+    Search {
+        /// Search query
+        query: String,
+
+        /// Filter by document type (task, task_result, context, knowledge)
+        #[arg(short = 't', long)]
+        doc_type: Option<String>,
+
+        /// Search in specific session (by ID or prefix)
+        #[arg(short, long)]
+        session: Option<String>,
+
+        /// Search across all sessions
+        #[arg(short, long)]
+        all: bool,
+
+        /// Maximum results to return
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+
+        /// Filter by start date (format: YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)
+        #[arg(long)]
+        from: Option<String>,
+
+        /// Filter by end date (format: YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)
+        #[arg(long)]
+        to: Option<String>,
+    },
+
+    /// Start API server
+    Server {
+        /// Host to bind to
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+
+        /// Port to bind to
+        #[arg(short, long, default_value = "8080")]
+        port: u16,
+
+        /// JWT secret key (can also use JWT_SECRET env var)
+        #[arg(long)]
+        jwt_secret: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -175,14 +220,22 @@ async fn main() -> Result<()> {
                                 .unwrap_or_default();
                             let progress = format!("{}/{}", s.completed_count, s.task_count);
                             let date = s.created_at.format("%Y-%m-%d %H:%M").to_string();
-                            let goal_short = if s.goal.len() > 40 {
-                                format!("{}...", &s.goal[..37])
+                            let goal_short: String = s.goal.chars().take(37).collect();
+                            let goal_short = if s.goal.chars().count() > 40 {
+                                format!("{}...", goal_short)
                             } else {
                                 s.goal.clone()
                             };
 
+                            // Detect format: new "001-abc123-..." vs legacy "abc123-..."
+                            // New format has 3 digits + dash at start
+                            let is_new_format = s.id.len() >= 4
+                                && s.id.chars().take(3).all(|c| c.is_ascii_digit())
+                                && s.id.chars().nth(3) == Some('-');
+                            let short_id_len = if is_new_format { 10 } else { 6 };
+                            let short_id = &s.id[..short_id_len.min(s.id.len())];
                             println!("{} {}{}  {}  {}  {}",
-                                status_icon, &s.id[..6.min(s.id.len())], label_str, progress, date, goal_short);
+                                status_icon, short_id, label_str, progress, date, goal_short);
                         }
                     }
                 }
@@ -502,9 +555,228 @@ async fn main() -> Result<()> {
             }
         }
 
+        Commands::Search { ref query, ref doc_type, ref session, all, limit, ref from, ref to } => {
+            use ouroboros::search::{SearchEngine, SearchOptions, DocumentType, SearchResult};
+            use ouroboros::work_session::WorkSessionManager;
+
+            let session_mgr = WorkSessionManager::new(&cli.data_dir)?;
+
+            // Collect search index paths based on options
+            let search_paths: Vec<(PathBuf, Option<String>)> = if all {
+                // Search all sessions
+                let sessions_dir = cli.data_dir.join("sessions");
+                if sessions_dir.exists() {
+                    std::fs::read_dir(&sessions_dir)?
+                        .filter_map(|e| e.ok())
+                        .filter(|e| e.path().is_dir())
+                        .map(|e| {
+                            let session_id = e.file_name().to_string_lossy().to_string();
+                            (e.path().join("search_index"), Some(session_id))
+                        })
+                        .filter(|(p, _)| p.exists())
+                        .collect()
+                } else {
+                    vec![]
+                }
+            } else if let Some(ref sid) = session {
+                // Search specific session by ID or prefix
+                let sessions_dir = cli.data_dir.join("sessions");
+                if sessions_dir.exists() {
+                    let matching: Vec<_> = std::fs::read_dir(&sessions_dir)?
+                        .filter_map(|e| e.ok())
+                        .filter(|e| {
+                            let name = e.file_name().to_string_lossy().to_string();
+                            name.starts_with(sid) || name.contains(sid)
+                        })
+                        .collect();
+
+                    if matching.is_empty() {
+                        println!("No session found matching: {}", sid);
+                        return Ok(());
+                    } else if matching.len() > 1 {
+                        println!("Multiple sessions match '{}'. Be more specific:", sid);
+                        for m in &matching {
+                            println!("  - {}", m.file_name().to_string_lossy());
+                        }
+                        return Ok(());
+                    }
+
+                    let session_id = matching[0].file_name().to_string_lossy().to_string();
+                    let path = matching[0].path().join("search_index");
+                    if path.exists() {
+                        vec![(path, Some(session_id))]
+                    } else {
+                        println!("No search index found for session: {}", sid);
+                        return Ok(());
+                    }
+                } else {
+                    vec![]
+                }
+            } else {
+                // Search current session only
+                if let Ok(Some(current)) = session_mgr.current_session() {
+                    let path = cli.data_dir.join("sessions").join(&current.id).join("search_index");
+                    if path.exists() {
+                        vec![(path, Some(current.id.clone()))]
+                    } else {
+                        vec![]
+                    }
+                } else {
+                    let path = cli.data_dir.join("search_index");
+                    if path.exists() {
+                        vec![(path, None)]
+                    } else {
+                        vec![]
+                    }
+                }
+            };
+
+            if search_paths.is_empty() {
+                println!("No search index found.");
+                println!("Index will be created when documents are added.");
+                return Ok(());
+            }
+
+            // Build search options
+            let mut options = SearchOptions::new().with_limit(limit);
+
+            if let Some(ref dtype) = doc_type {
+                let dt = match dtype.as_str() {
+                    "task" => DocumentType::Task,
+                    "task_result" | "result" => DocumentType::TaskResult,
+                    "context" => DocumentType::Context,
+                    "knowledge" => DocumentType::Knowledge,
+                    "plan" => DocumentType::Plan,
+                    _ => {
+                        println!("Unknown document type: {}. Use: task, task_result, context, knowledge, plan", dtype);
+                        return Ok(());
+                    }
+                };
+                options = options.with_doc_type(dt);
+            }
+
+            // Parse date filters
+            if let Some(ref from_str) = from {
+                match parse_date_string(from_str) {
+                    Ok(date) => {
+                        options = options.with_date_from(date);
+                    }
+                    Err(e) => {
+                        println!("Invalid 'from' date format: {}. Use YYYY-MM-DD or YYYY-MM-DD HH:MM:SS", e);
+                        return Ok(());
+                    }
+                }
+            }
+
+            if let Some(ref to_str) = to {
+                match parse_date_string(to_str) {
+                    Ok(date) => {
+                        options = options.with_date_to(date);
+                    }
+                    Err(e) => {
+                        println!("Invalid 'to' date format: {}. Use YYYY-MM-DD or YYYY-MM-DD HH:MM:SS", e);
+                        return Ok(());
+                    }
+                }
+            }
+
+            // Search across all paths and collect results
+            let mut all_results: Vec<(SearchResult, String)> = Vec::new();
+
+            for (search_path, session_id) in &search_paths {
+                let engine = SearchEngine::keyword_reader_only(search_path)?;
+                let results = engine.search(query, &options).await?;
+                let sid = session_id.clone().unwrap_or_else(|| "default".to_string());
+                for r in results {
+                    all_results.push((r, sid.clone()));
+                }
+            }
+
+            // Sort by score descending
+            all_results.sort_by(|a, b| b.0.score.partial_cmp(&a.0.score).unwrap_or(std::cmp::Ordering::Equal));
+
+            // Limit total results
+            all_results.truncate(limit);
+
+            if all_results.is_empty() {
+                println!("No results found for: \"{}\"", query);
+                if all {
+                    println!("Searched {} session(s)", search_paths.len());
+                }
+                return Ok(());
+            }
+
+            let session_info = if all {
+                format!(" (across {} sessions)", search_paths.len())
+            } else if let Some((_, ref sid)) = all_results.first() {
+                format!(" [session: {}]", &sid[..8.min(sid.len())])
+            } else {
+                String::new()
+            };
+
+            println!("Search results for \"{}\"{} ({} found):", query, session_info, all_results.len());
+            println!("{}", "=".repeat(70));
+
+            for (i, (r, sid)) in all_results.iter().enumerate() {
+                let content_preview: String = r.content
+                    .chars()
+                    .take(200)
+                    .collect::<String>()
+                    .replace('\n', " ");
+
+                let session_marker = if all { format!(" @{}", &sid[..8.min(sid.len())]) } else { String::new() };
+                println!("[{}] {:?} | {}{} (score: {:.2})", i + 1, r.doc_type, r.title, session_marker, r.score);
+                println!("    {}", content_preview);
+                if content_preview.len() >= 200 {
+                    println!("    ...");
+                }
+                println!();
+            }
+        }
+
+        Commands::Server { ref host, port, ref jwt_secret } => {
+            use ouroboros::api::server::{ApiServer, ApiServerConfig};
+
+            let secret = jwt_secret
+                .clone()
+                .or_else(|| std::env::var("JWT_SECRET").ok())
+                .unwrap_or_else(|| {
+                    println!("Warning: Using default JWT secret. Set JWT_SECRET env var or --jwt-secret for production.");
+                    "default_secret_change_in_production".to_string()
+                });
+
+            let config = ApiServerConfig {
+                host: host.clone(),
+                port,
+                jwt_secret: secret,
+                data_dir: cli.data_dir.clone(),
+            };
+
+            let server = ApiServer::new(config);
+            println!("Starting API server on {}:{}", host, port);
+            server.start().await?;
+        }
+
     }
 
     Ok(())
+}
+
+fn parse_date_string(date_str: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+    use chrono::{NaiveDate, NaiveDateTime, TimeZone};
+
+    // Try parsing with time first (YYYY-MM-DD HH:MM:SS)
+    if let Ok(dt) = NaiveDateTime::parse_from_str(date_str, "%Y-%m-%d %H:%M:%S") {
+        return Ok(chrono::Utc.from_utc_datetime(&dt));
+    }
+
+    // Try parsing date only (YYYY-MM-DD)
+    if let Ok(date) = NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+        let dt = date.and_hms_opt(0, 0, 0).unwrap();
+        return Ok(chrono::Utc.from_utc_datetime(&dt));
+    }
+
+    anyhow::bail!("Invalid date format. Use YYYY-MM-DD or YYYY-MM-DD HH:MM:SS")
 }
 
 fn init_project(data_dir: &PathBuf) -> Result<()> {

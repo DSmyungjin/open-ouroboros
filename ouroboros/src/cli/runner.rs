@@ -99,7 +99,8 @@ impl CliRunner {
         // Add prompt as positional argument (must be last)
         cmd.arg(prompt);
 
-        // Capture output
+        // Capture output and close stdin to prevent blocking
+        cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
