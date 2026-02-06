@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::cli::{CliRunner, CliOptions, Model};
 use crate::dag::{DagManager, DagStats, Task, ContextTree, ExecutionPlan};
 use crate::docs::{DocumentStore, Document, DocType};
+use crate::knowledge::KnowledgeExtractor;
 use crate::search::SearchEngine;
 use crate::work_session::{WorkSessionManager, WorkSession};
 
@@ -13,6 +14,7 @@ pub struct Orchestrator {
     dag: DagManager,
     docs: DocumentStore,
     search: Option<SearchEngine>,
+    knowledge_extractor: Option<KnowledgeExtractor>,
     config: OrchestratorConfig,
     #[allow(dead_code)]
     base_data_dir: PathBuf,
@@ -42,6 +44,8 @@ pub struct OrchestratorConfig {
     pub auto_search_max_results: usize,
     /// Minimum score threshold for auto-search results
     pub auto_search_min_score: f32,
+    /// Enable automatic knowledge extraction from task results
+    pub knowledge_extraction_enabled: bool,
 }
 
 impl Default for OrchestratorConfig {
@@ -58,6 +62,7 @@ impl Default for OrchestratorConfig {
             auto_search_enabled: true,        // Enable by default
             auto_search_max_results: 5,       // Top 5 results
             auto_search_min_score: 0.3,       // Minimum relevance
+            knowledge_extraction_enabled: true, // Enable by default
         }
     }
 }
@@ -108,11 +113,15 @@ impl Orchestrator {
         let search_path = session_data_dir.join("search_index");
         let search = SearchEngine::keyword_only(&search_path).ok();
 
+        // Initialize knowledge extractor
+        let knowledge_extractor = Some(KnowledgeExtractor::new(cli.clone()));
+
         Ok(Self {
             cli,
             dag,
             docs,
             search,
+            knowledge_extractor,
             config: OrchestratorConfig::default(),
             base_data_dir: data_dir,
             session_data_dir,
@@ -172,7 +181,7 @@ impl Orchestrator {
             content
                 .and_then(|c| serde_json::from_str(&c).ok())
                 .map(ContextTree::from_state)
-                .unwrap_or_else(ContextTree::new)
+                .unwrap_or_default()
         } else {
             ContextTree::new()
         };
@@ -555,6 +564,13 @@ Output ONLY the JSON object, no other text."#,
                     tracing::warn!("Context node {} not found, skipping addition", node_id);
                 }
             }
+
+            // Extract and index knowledge from successful task (skip context_fill tasks)
+            if self.config.knowledge_extraction_enabled && !task.is_context_fill() {
+                if let Err(e) = self.extract_and_index_success_knowledge(&task, &output.response).await {
+                    tracing::warn!("Failed to extract knowledge from task {}: {}", task_id, e);
+                }
+            }
         } else {
             self.dag.get_task_mut(task_id).unwrap().fail("CLI execution failed");
         }
@@ -646,9 +662,16 @@ Output ONLY the JSON object, no other text."#,
     /// Retry a failed task with accumulated context
     pub async fn retry_task(&mut self, task_id: &str) -> Result<TaskResult> {
         let task = self.dag.get_task(task_id)
-            .ok_or_else(|| anyhow::anyhow!("Task not found: {}", task_id))?;
+            .ok_or_else(|| anyhow::anyhow!("Task not found: {}", task_id))?
+            .clone();
 
         if task.attempts.len() >= self.config.max_retries as usize {
+            // Extract knowledge from failure before returning error
+            if self.config.knowledge_extraction_enabled {
+                if let Err(e) = self.extract_and_index_failure_knowledge(&task).await {
+                    tracing::warn!("Failed to extract failure knowledge from task {}: {}", task_id, e);
+                }
+            }
             return Err(anyhow::anyhow!(
                 "Task {} exceeded max retries ({})",
                 task_id,
@@ -1537,7 +1560,8 @@ Summary of the minor fixes applied."#,
                 Ok(session_search) => {
                     let options = crate::search::SearchOptions::new()
                         .with_limit(self.config.auto_search_max_results)
-                        .with_min_score(self.config.auto_search_min_score);
+                        .with_min_score(self.config.auto_search_min_score)
+                        .with_doc_type(crate::search::DocumentType::Knowledge);
 
                     match session_search.search(&query, &options).await {
                         Ok(results) => {
@@ -1629,8 +1653,11 @@ ouroboros search "keyword" --all
 ouroboros search "keyword" -t knowledge --all
 ```
 
-## Output Format
-Produce a well-organized document with clear sections.
+## IMPORTANT: Output Format
+- **Include ALL research findings in your text response**, not in separate files
+- Your text response will be saved as the context document for downstream tasks
+- Your text response will be used for knowledge extraction and cross-session search
+- Produce a well-organized document with clear sections directly in your response
 "#,
                 target_node
             ),
@@ -1647,6 +1674,13 @@ Reference documents are provided above. Use them as your primary source.
   - Do NOT guess or make assumptions
   - Search past knowledge or spawn a research sub-agent
 - Keep your work focused on the task at hand
+
+## IMPORTANT: Output Format
+- **Include ALL important content in your text response**, not just file references
+- When you create or modify files, also include the key content/learnings in your response
+- Your text response will be used for knowledge extraction and cross-session search
+- If you write code, include the important parts in your response with explanation
+- Summaries like "I created a file" are NOT sufficient - include the actual content
 
 ## Searching Past Knowledge
 Before researching externally, search the knowledge base for relevant information:
@@ -1764,6 +1798,83 @@ This will be saved and made available to other tasks referencing that context no
             }],
             tasks,
         })
+    }
+
+    // =========================================================================
+    // Knowledge Extraction Helpers
+    // =========================================================================
+
+    /// Extract and index knowledge from a successfully completed task
+    async fn extract_and_index_success_knowledge(
+        &mut self,
+        task: &Task,
+        output: &str,
+    ) -> Result<()> {
+        let extractor = match &self.knowledge_extractor {
+            Some(e) => e.clone(),
+            None => return Ok(()), // Knowledge extraction not configured
+        };
+
+        tracing::info!("Extracting knowledge from successful task: {}", task.id);
+
+        let entries = extractor.extract_from_success(task, output).await?;
+
+        for entry in entries {
+            self.index_knowledge_entry(entry).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Extract and index knowledge from a failed task (after max retries)
+    async fn extract_and_index_failure_knowledge(&mut self, task: &Task) -> Result<()> {
+        let extractor = match &self.knowledge_extractor {
+            Some(e) => e.clone(),
+            None => return Ok(()), // Knowledge extraction not configured
+        };
+
+        tracing::info!("Extracting knowledge from failed task: {}", task.id);
+
+        let entries = extractor.extract_from_failure(task).await?;
+
+        for entry in entries {
+            self.index_knowledge_entry(entry).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Index a knowledge entry in the search engine
+    async fn index_knowledge_entry(
+        &mut self,
+        mut entry: crate::knowledge::KnowledgeEntry,
+    ) -> Result<()> {
+        // Set session ID if available
+        if let Some(ref session) = self.current_session {
+            entry = entry.with_session_id(&session.id);
+        }
+
+        // Index in search engine
+        if let Some(ref mut search) = self.search {
+            let session_id = entry.source_session_id.as_deref();
+            let content = entry.to_search_content();
+
+            search.index_knowledge(
+                &entry.id,
+                &entry.title,
+                &content,
+                session_id,
+            ).await?;
+
+            tracing::info!(
+                "Indexed knowledge entry: {} [{}] - {}",
+                entry.id,
+                entry.category.as_str(),
+                entry.title
+            );
+        }
+
+        Ok(())
     }
 
 }

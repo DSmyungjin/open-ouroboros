@@ -13,18 +13,15 @@ use super::task::{Task, TaskStatus};
 /// Edge type in the DAG
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum EdgeType {
     /// Regular dependency: source must complete before target starts (sequential)
+    #[default]
     Dependency,
     /// Fork edge: source completion triggers parallel execution of targets
     Fork,
 }
 
-impl Default for EdgeType {
-    fn default() -> Self {
-        EdgeType::Dependency
-    }
-}
 
 pub struct DagManager {
     graph: DiGraph<String, EdgeType>,  // Node = task_id, Edge = relationship type

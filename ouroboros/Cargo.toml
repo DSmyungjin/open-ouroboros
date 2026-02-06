@@ -20,14 +20,8 @@ anyhow = "1"
 thiserror = "2"
 dirs = "5"
 
-# Search dependencies
-lancedb = "0.15"
-arrow-array = "53"
-arrow-schema = "53"
+# Search dependencies (BM25 keyword search)
 tantivy = "0.25"
-lindera-tantivy = "2.0"
-lindera = { version = "2.1", features = ["embed-ko-dic"] }
-fastembed = "4"
 
 # Web server dependencies
 axum = "0.7"

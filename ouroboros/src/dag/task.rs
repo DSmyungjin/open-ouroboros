@@ -75,7 +75,9 @@ pub struct Task {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Default)]
 pub enum TaskStatus {
+    #[default]
     Pending,
     InProgress,
     Completed,
@@ -217,11 +219,6 @@ impl Task {
     }
 }
 
-impl Default for TaskStatus {
-    fn default() -> Self {
-        TaskStatus::Pending
-    }
-}
 
 #[cfg(test)]
 mod tests {

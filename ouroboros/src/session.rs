@@ -213,7 +213,7 @@ pub fn get_claude_projects_dir() -> Result<PathBuf> {
 /// Encode project path to Claude's format
 /// `/path/to/project` -> `-path-to-project`
 pub fn encode_project_path(path: &str) -> String {
-    path.replace('/', "-").replace('_', "-")
+    path.replace(['/', '_'], "-")
 }
 
 /// Decode Claude's path format back to original

@@ -1,26 +1,18 @@
-//! Keyword search using Tantivy (BM25) with Korean morphological analysis
+//! Keyword search using Tantivy (BM25)
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use lindera::dictionary::{DictionaryKind, load_embedded_dictionary};
-use lindera::mode::Mode;
-use lindera::segmenter::Segmenter;
-use lindera_tantivy::tokenizer::LinderaTokenizer;
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
-use tantivy::schema::{Field, Schema, TextFieldIndexing, TextOptions, STORED, INDEXED};
+use tantivy::schema::{Field, Schema, STORED, INDEXED, TEXT};
 use tantivy::schema::Value;
-use tantivy::tokenizer::{LowerCaser, TextAnalyzer};
 use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument};
 use tracing::{debug, info};
 
 use super::types::{DocumentType, SearchDocument, SearchOptions, SearchResult, SearchSource};
 
-/// Tokenizer name for Korean morphological analysis
-const KOREAN_TOKENIZER: &str = "korean";
-
-/// Keyword search engine using Tantivy with multilingual support
+/// Keyword search engine using Tantivy BM25
 pub struct KeywordSearch {
     index: Index,
     reader: IndexReader,
@@ -38,7 +30,7 @@ pub struct KeywordSearch {
 }
 
 impl KeywordSearch {
-    /// Create a new keyword search instance with multilingual support (read-write mode)
+    /// Create a new keyword search instance (read-write mode)
     pub fn new(index_path: impl AsRef<Path>) -> Result<Self> {
         Self::new_internal(index_path, true)
     }
@@ -57,7 +49,7 @@ impl KeywordSearch {
             index_path, with_writer
         );
 
-        // Build schema with multilingual tokenizer for title and content
+        // Build schema with default tokenizer for title and content
         let mut schema_builder = Schema::builder();
 
         // Simple fields (no special tokenization needed)
@@ -69,17 +61,9 @@ impl KeywordSearch {
         // Date field for filtering
         let created_at_field = schema_builder.add_date_field("created_at", INDEXED | STORED);
 
-        // Multilingual fields for title and content
-        let text_options = TextOptions::default()
-            .set_indexing_options(
-                TextFieldIndexing::default()
-                    .set_tokenizer(KOREAN_TOKENIZER)
-                    .set_index_option(tantivy::schema::IndexRecordOption::WithFreqsAndPositions),
-            )
-            .set_stored();
-
-        let title_field = schema_builder.add_text_field("title", text_options.clone());
-        let content_field = schema_builder.add_text_field("content", text_options);
+        // Text fields with default tokenizer (English-optimized)
+        let title_field = schema_builder.add_text_field("title", TEXT | STORED);
+        let content_field = schema_builder.add_text_field("content", TEXT | STORED);
         let schema = schema_builder.build();
 
         // Open or create index
@@ -88,9 +72,6 @@ impl KeywordSearch {
             tantivy::directory::MmapDirectory::open(index_path)?,
             schema.clone(),
         )?;
-
-        // Register Korean morphological tokenizer
-        Self::register_korean_tokenizer(&index)?;
 
         // Create writer only if requested (50MB heap)
         let writer = if with_writer {
@@ -267,32 +248,6 @@ impl KeywordSearch {
     pub fn count(&self) -> Result<usize> {
         let searcher = self.reader.searcher();
         Ok(searcher.num_docs() as usize)
-    }
-
-    /// Register Korean morphological tokenizer using Lindera
-    fn register_korean_tokenizer(index: &Index) -> Result<()> {
-        // Load Korean dictionary (KoDic)
-        let dictionary = load_embedded_dictionary(DictionaryKind::KoDic)
-            .context("Failed to load Korean dictionary")?;
-
-        // Create segmenter with Korean dictionary
-        let segmenter = Segmenter::new(Mode::Normal, dictionary, None);
-
-        // Create Lindera tokenizer from segmenter
-        let lindera_tokenizer = LinderaTokenizer::from_segmenter(segmenter);
-
-        // Build text analyzer with Lindera + lowercase
-        let text_analyzer = TextAnalyzer::builder(lindera_tokenizer)
-            .filter(LowerCaser)
-            .build();
-
-        // Register the tokenizer
-        index
-            .tokenizers()
-            .register(KOREAN_TOKENIZER, text_analyzer);
-
-        info!("Registered Korean morphological tokenizer (Lindera + KoDic)");
-        Ok(())
     }
 }
 

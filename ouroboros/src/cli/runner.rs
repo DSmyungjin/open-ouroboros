@@ -6,8 +6,10 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum Model {
     Opus,
+    #[default]
     Sonnet,
     Haiku,
 }
@@ -22,11 +24,6 @@ impl Model {
     }
 }
 
-impl Default for Model {
-    fn default() -> Self {
-        Model::Sonnet
-    }
-}
 
 #[derive(Debug, Clone, Default)]
 pub struct CliOptions {
