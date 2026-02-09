@@ -15,7 +15,10 @@
         "email": ""
       },
       "category": "productivity",
-      "source": ".",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/DSmyungjin/open-ouroboros.git"
+      },
       "version": "0.1.0"
     }
   ]
