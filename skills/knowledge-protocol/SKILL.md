@@ -28,6 +28,7 @@ When your work is complete, create a session log at `docs/session-log/YYYY-MM-DD
 - Every unresolved question gets `[Q#]` ID
 - Cross-session references use `[session-YYYY-MM-DD-topic/ID]` format
 - Causal chains use `→` notation
+- **Namespace prefix**: If `docs/decisions.md` defines namespace prefixes (e.g., `E-` for Entrepreneur, `L-` for Lab), use them: `[E-D1]`, `[L-F2]`, `[E-Q3]`. If no namespaces are defined, use plain `[D#]`.
 
 Then update the shared knowledge files:
 

@@ -5,6 +5,7 @@ Unresolved items only. When you resolve one:
 2. Delete the question from this file
 
 This file should only contain questions that are still open.
+Use namespace prefixes when multiple teams share this file (e.g., `[E-Q#]`, `[L-Q#]`).
 
 ---
 
