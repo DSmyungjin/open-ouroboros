@@ -4,19 +4,15 @@ description: Initialize the Ouroboros knowledge base in the current project
 disable-model-invocation: true
 ---
 
-Create the following directory structure in the current project if it doesn't exist:
+Initialize the Ouroboros knowledge base. **NEVER overwrite existing files.**
 
-```
-docs/
-  TEMPLATE.md
-  decisions.md
-  open-questions.md
-  session-log/
-```
+For each file below, SKIP if it already exists. Only create missing ones.
 
-1. Create `docs/session-log/` directory
-2. Create `docs/TEMPLATE.md` with the session output template from the knowledge-protocol skill's TEMPLATE.md
-3. Create `docs/decisions.md` with this content:
+1. Create `docs/session-log/` directory (if not exists)
+
+2. **SKIP if exists**, otherwise create `docs/TEMPLATE.md` with the session output template from the knowledge-protocol skill's TEMPLATE.md
+
+3. **SKIP if exists**, otherwise create `docs/decisions.md` with:
 
 ```
 # Decisions
@@ -27,7 +23,7 @@ When this file exceeds 50 entries, archive older decisions to docs/decisions-arc
 ---
 ```
 
-4. Create `docs/open-questions.md` with this content:
+4. **SKIP if exists**, otherwise create `docs/open-questions.md` with:
 
 ```
 # Open Questions
@@ -41,7 +37,7 @@ This file should only contain questions that are still open.
 ---
 ```
 
-5. Add this to the project's `CLAUDE.md` (create if it doesn't exist):
+5. **Append** to the project's `CLAUDE.md` (create if it doesn't exist) — but only if it doesn't already contain "Knowledge Protocol":
 
 ```
 # Knowledge Protocol
@@ -51,4 +47,4 @@ Before starting work, read docs/decisions.md and docs/open-questions.md.
 After finishing, log your session to docs/session-log/.
 ```
 
-Report what was created.
+Report what was created and what was skipped (already existed).
