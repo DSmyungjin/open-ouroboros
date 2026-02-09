@@ -5,12 +5,10 @@ When this file exceeds 50 entries, archive older decisions to `docs/decisions-ar
 
 ## Namespace Convention
 
-When multiple teams or systems share this file, prefix IDs with a short identifier:
-- `[E-D#]` = Entrepreneur team decisions (KILL / PIVOT / SCALE)
-- `[L-D#]` = Lab team decisions (ACCEPT / REJECT / REVISE)
-- `[D#]` = General decisions (no team context)
-
-Same prefix rule applies to findings `[E-F#]` and questions `[E-Q#]`.
+When multiple teams share this file, prefix IDs to avoid collisions:
+- `[X-D#]`, `[X-F#]`, `[X-Q#]` where `X` is a short team identifier
+- `[D#]` = no prefix when only one team uses the file
+- Define your project's prefixes below this line:
 
 ---
 
