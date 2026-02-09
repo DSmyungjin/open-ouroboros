@@ -1,8 +1,5 @@
 {
   "name": "ouroboros",
   "version": "0.1.0",
-  "description": "Persistent knowledge accumulation across Claude Code sessions and agent teams. File-based protocol — no database, no search engine.",
-  "author": {
-    "name": "kimmyungjin"
-  }
+  "description": "Persistent knowledge accumulation across Claude Code sessions and agent teams."
 }
