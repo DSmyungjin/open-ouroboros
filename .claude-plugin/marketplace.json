@@ -10,7 +10,7 @@
     {
       "name": "ouroboros",
       "description": "File-based knowledge protocol for Claude Code. Accumulates decisions, findings, and questions across sessions via structured markdown.",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "author": {
         "name": "kimmyungjin",
         "email": ""
