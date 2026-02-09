@@ -38,5 +38,7 @@ Then update the shared knowledge files:
 ## Important
 
 - `docs/decisions.md` is append-only. Never delete or rewrite past entries.
+- `docs/open-questions.md` is a live list. Resolved questions must be deleted from it (the resolution lives in `decisions.md` and the session log).
+- When `docs/decisions.md` exceeds 50 entries, move older entries to `docs/decisions-archive/YYYY-QN.md` and keep only the latest 50.
 - Keep session logs factual and concise. No filler.
 - If `docs/` doesn't exist, suggest running `/ouroboros:init` first.

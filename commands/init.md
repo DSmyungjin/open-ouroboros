@@ -22,6 +22,7 @@ docs/
 # Decisions
 
 Append-only log. Every entry must have rationale.
+When this file exceeds 50 entries, archive older decisions to docs/decisions-archive/YYYY-QN.md and keep only the latest 50 here.
 
 ---
 ```
@@ -31,7 +32,11 @@ Append-only log. Every entry must have rationale.
 ```
 # Open Questions
 
-Items no session has resolved yet. If you can answer one, move it to decisions.md.
+Unresolved items only. When you resolve one:
+1. Record the resolution as a decision in decisions.md
+2. Delete the question from this file
+
+This file should only contain questions that are still open.
 
 ---
 ```

@@ -1,6 +1,7 @@
 # Decisions
 
 Append-only log. Every entry must have rationale.
+When this file exceeds 50 entries, archive older decisions to `docs/decisions-archive/YYYY-QN.md` and keep only the latest 50 here.
 
 ---
 
