@@ -1,0 +1,23 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "ouroboros",
+  "description": "Persistent knowledge accumulation across Claude Code sessions and agent teams",
+  "owner": {
+    "name": "kimmyungjin",
+    "email": ""
+  },
+  "plugins": [
+    {
+      "name": "ouroboros",
+      "description": "File-based knowledge protocol for Claude Code. Accumulates decisions, findings, and questions across sessions via structured markdown.",
+      "version": "0.1.0",
+      "author": {
+        "name": "kimmyungjin",
+        "email": ""
+      },
+      "source": "./",
+      "category": "productivity",
+      "homepage": "https://github.com/DSmyungjin/open-ouroboros"
+    }
+  ]
+}
